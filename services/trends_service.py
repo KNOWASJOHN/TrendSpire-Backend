@@ -4,6 +4,12 @@ import requests
 import json
 import time
 import random
+import threading
+import concurrent.futures
+from typing import Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import requests.exceptions as req_exceptions
 
 # ─────────────────────────────────────────────
 # Google Trends – Direct HTTP Fetcher
@@ -37,6 +43,23 @@ _HEADERS = {
 MAX_RETRIES = 2
 RETRY_DELAY = 3  # seconds between retries
 
+# Global session with retry/backoff
+_SESSION = requests.Session()
+_RETRY_STRATEGY = Retry(
+    total=2,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
+_ADAPTER = HTTPAdapter(max_retries=_RETRY_STRATEGY)
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
+
+# Simple in-memory TTL cache to reduce live calls
+_CACHE: dict[str, tuple[float, dict]] = {}
+_CACHE_TTL = 300  # seconds
+_CACHE_LOCK = threading.Lock()
+
 
 def fetch_google_trends(keyword: str) -> dict:
     """
@@ -46,17 +69,31 @@ def fetch_google_trends(keyword: str) -> dict:
     Returns a dict with current interest, average, growth %, and normalized score.
     Falls back to neutral values (score=50) if the API fails or returns empty data.
     """
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return _fetch_live(keyword)
-        except Exception as e:
-            print(f"[TRENDS] Attempt {attempt}/{MAX_RETRIES} failed for '{keyword}': {e}")
-            if attempt < MAX_RETRIES:
-                delay = RETRY_DELAY * attempt + random.uniform(0, 1)
-                print(f"[TRENDS] Retrying in {delay:.1f}s...")
-                time.sleep(delay)
+    # Check cache
+    now = time.time()
+    with _CACHE_LOCK:
+        cached = _CACHE.get(keyword)
+        if cached and cached[0] > now:
+            # return cached copy
+            return dict(cached[1])
 
-    return _neutral_fallback(keyword, reason="all_retries_exhausted")
+    # Run network fetch off the main Gunicorn worker thread
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_fetch_live, keyword)
+        try:
+            result = fut.result(timeout=30)
+            # store in cache
+            with _CACHE_LOCK:
+                _CACHE[keyword] = (time.time() + _CACHE_TTL, result)
+            return result
+        except concurrent.futures.TimeoutError:
+            print(f"[TRENDS] Timeout fetching live data for '{keyword}'")
+        except req_exceptions.HTTPError as e:
+            print(f"[TRENDS] HTTP error fetching '{keyword}': {e}")
+        except Exception as e:
+            print(f"[TRENDS] Unexpected error fetching '{keyword}': {e}")
+
+    return _neutral_fallback(keyword, reason="all_retries_exhausted_or_error")
 
 
 def _fetch_live(keyword: str) -> dict:
@@ -64,13 +101,13 @@ def _fetch_live(keyword: str) -> dict:
     Core fetcher: creates a session, gets a token from /explore,
     then fetches interest-over-time data from /widgetdata/multiline.
     """
-    session = requests.Session()
+    # Use the global session configured with retries
+    session = _SESSION
     session.headers.update(_HEADERS)
 
     # Step 0: Visit the trends page to pick up initial cookies (NID, etc.)
+    # Do not sleep here — the session has retry/backoff configured
     session.get(f"{_BASE_URL}/explore", timeout=15)
-    time.sleep(random.uniform(0.5, 1.5))
-
     # Step 1: Call /explore to get the TIMESERIES widget token
     explore_payload = {
         "comparisonItem": [
@@ -93,7 +130,7 @@ def _fetch_live(keyword: str) -> dict:
     resp = session.get(_EXPLORE_URL, params=params, timeout=15)
     resp.raise_for_status()
 
-    # Google prefixes response with ")]}',\n" to prevent JSON hijacking
+    # Google prefixes response with ")]}'\n" to prevent JSON hijacking
     raw_text = resp.text
     if raw_text.startswith(")]}'"):
         raw_text = raw_text[5:]
@@ -112,9 +149,7 @@ def _fetch_live(keyword: str) -> dict:
     if not token or not req_payload:
         raise ValueError("Could not find TIMESERIES widget token in explore response")
 
-    time.sleep(random.uniform(1.0, 2.0))
-
-    # Step 2: Fetch the actual interest-over-time data
+    # Step 2: Fetch the actual interest-over-time data (retries handled by session)
     multiline_params = {
         "hl": "en-IN",
         "tz": "-330",
